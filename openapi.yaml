@@ -1,0 +1,1471 @@
+openapi: 3.1.0
+info:
+  title: Agent Dispatch Messaging Protocol (ADMP)
+  version: 1.0.0
+  description: |
+    Universal inbox for autonomous AI agents. ADMP provides standardized messaging infrastructure
+    for AI agents to communicate reliably and securely with at-least-once delivery semantics.
+
+    ## Features
+    - Agent registration with Ed25519 keypairs
+    - Message queuing with cryptographic signatures
+    - Lease-based processing (at-least-once delivery)
+    - Webhook push delivery (real-time notifications)
+    - Heartbeat-based agent status tracking
+    - Trust management between agents
+
+  contact:
+    name: Agent Dispatch Working Group
+    email: standards@agentdispatch.org
+  license:
+    name: MIT
+    url: https://opensource.org/licenses/MIT
+
+servers:
+  - url: http://localhost:8080
+    description: Local development server
+  - url: https://dispatch.example.com
+    description: Production server
+
+tags:
+  - name: Agents
+    description: Agent registration and management
+  - name: Messages
+    description: Message sending and delivery
+  - name: Inbox
+    description: Inbox operations (pull, ack, nack)
+  - name: Groups
+    description: Multi-party messaging via groups (membership + fanout + history)
+  - name: Webhooks
+    description: Webhook configuration for push delivery
+  - name: System
+    description: System health and statistics
+
+paths:
+  /health:
+    get:
+      tags: [System]
+      summary: Health check
+      description: Check server health status
+      responses:
+        '200':
+          description: Server is healthy
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: healthy
+                  timestamp:
+                    type: string
+                    format: date-time
+                  version:
+                    type: string
+                    example: '1.0.0'
+
+  /api/stats:
+    get:
+      tags: [System]
+      summary: Get system statistics
+      description: Retrieve server-wide statistics for agents and messages
+      responses:
+        '200':
+          description: System statistics
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SystemStats'
+
+  /api/agents/register:
+    post:
+      tags: [Agents]
+      summary: Register a new agent
+      description: |
+        Register a new agent with the ADMP server. Returns Ed25519 keypair for message signing.
+        Optionally configure webhook for push delivery.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AgentRegistration'
+      responses:
+        '201':
+          description: Agent registered successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AgentRegistrationResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+
+  /api/agents/{agentId}:
+    get:
+      tags: [Agents]
+      summary: Get agent details
+      description: Retrieve agent information (excluding secret key)
+      parameters:
+        - $ref: '#/components/parameters/AgentId'
+      security:
+        - AgentAuth: []
+      responses:
+        '200':
+          description: Agent details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Agent'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    delete:
+      tags: [Agents]
+      summary: Deregister agent
+      description: Remove agent and all associated data
+      parameters:
+        - $ref: '#/components/parameters/AgentId'
+      security:
+        - AgentAuth: []
+      responses:
+        '204':
+          description: Agent deregistered
+        '400':
+          $ref: '#/components/responses/BadRequest'
+
+  /api/agents/{agentId}/heartbeat:
+    post:
+      tags: [Agents]
+      summary: Send heartbeat
+      description: |
+        Update agent's heartbeat to maintain online status. Agents must send heartbeat
+        within timeout period (default 5 minutes) or will be marked offline.
+      parameters:
+        - $ref: '#/components/parameters/AgentId'
+      security:
+        - AgentAuth: []
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                metadata:
+                  type: object
+                  additionalProperties: true
+      responses:
+        '200':
+          description: Heartbeat updated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  last_heartbeat:
+                    type: integer
+                    format: int64
+                  timeout_at:
+                    type: integer
+                    format: int64
+                  status:
+                    type: string
+                    enum: [online, offline]
+
+  /api/agents/{agentId}/messages:
+    post:
+      tags: [Messages]
+      summary: Send message to agent
+      description: |
+        Send a message to an agent's inbox. Message must be signed with sender's secret key.
+        If recipient has webhook configured, message will be pushed immediately.
+      parameters:
+        - $ref: '#/components/parameters/AgentId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: '#/components/schemas/MessageEnvelope'
+                - type: object
+                  properties:
+                    ephemeral:
+                      type: boolean
+                      default: false
+                      description: |
+                        When true, message body is purged from storage immediately on ack.
+                        Delivery metadata is preserved for audit trail.
+                    ttl:
+                      type: string
+                      description: |
+                        Ephemeral TTL — auto-purge after this duration regardless of ack status.
+                        Supports: "30m" (minutes), "1h" (hours), "7d" (days), or raw seconds as string.
+                        Combines with ephemeral: ack triggers early purge, TTL sets max lifetime.
+                      example: '24h'
+      responses:
+        '201':
+          description: Message queued
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message_id:
+                    type: string
+                  status:
+                    type: string
+                    enum: [queued, delivered]
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/agents/{agentId}/inbox/pull:
+    post:
+      tags: [Inbox]
+      summary: Pull message from inbox
+      description: |
+        Retrieve oldest available message from inbox with lease. Message is locked for
+        visibility_timeout seconds. Must ACK or NACK before lease expires.
+      parameters:
+        - $ref: '#/components/parameters/AgentId'
+      security:
+        - AgentAuth: []
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                visibility_timeout:
+                  type: integer
+                  default: 60
+                  minimum: 1
+                  maximum: 3600
+      responses:
+        '200':
+          description: Message leased
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LeasedMessage'
+        '204':
+          description: Inbox empty
+        '400':
+          $ref: '#/components/responses/BadRequest'
+
+  /api/agents/{agentId}/inbox/stats:
+    get:
+      tags: [Inbox]
+      summary: Get inbox statistics
+      description: Retrieve message counts by status for agent's inbox
+      parameters:
+        - $ref: '#/components/parameters/AgentId'
+      security:
+        - AgentAuth: []
+      responses:
+        '200':
+          description: Inbox statistics
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InboxStats'
+
+  /api/agents/{agentId}/messages/{messageId}/ack:
+    post:
+      tags: [Inbox]
+      summary: Acknowledge message
+      description: |
+        Confirm successful processing of message. Message is deleted from inbox.
+      parameters:
+        - $ref: '#/components/parameters/AgentId'
+        - $ref: '#/components/parameters/MessageId'
+      security:
+        - AgentAuth: []
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                result:
+                  type: object
+                  additionalProperties: true
+      responses:
+        '200':
+          description: Message acknowledged
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/agents/{agentId}/messages/{messageId}/nack:
+    post:
+      tags: [Inbox]
+      summary: Negative acknowledge message
+      description: |
+        Reject message or extend lease. If requeue=true, message returns to queue.
+        If extend_sec provided, lease is extended.
+      parameters:
+        - $ref: '#/components/parameters/AgentId'
+        - $ref: '#/components/parameters/MessageId'
+      security:
+        - AgentAuth: []
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                requeue:
+                  type: boolean
+                extend_sec:
+                  type: integer
+                  minimum: 1
+                  maximum: 3600
+      responses:
+        '200':
+          description: Message nacked or lease extended
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  status:
+                    type: string
+                  lease_until:
+                    type: integer
+                    format: int64
+                    nullable: true
+
+  /api/agents/{agentId}/messages/{messageId}/reply:
+    post:
+      tags: [Messages]
+      summary: Reply to message
+      description: |
+        Send correlated response to original sender. Automatically sets correlation_id
+        and swaps from/to fields.
+      parameters:
+        - $ref: '#/components/parameters/AgentId'
+        - $ref: '#/components/parameters/MessageId'
+      security:
+        - AgentAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReplyEnvelope'
+      responses:
+        '200':
+          description: Reply sent
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message_id:
+                    type: string
+                  status:
+                    type: string
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/messages/{messageId}/status:
+    get:
+      tags: [Messages]
+      summary: Get message status
+      description: Query delivery status of a message
+      parameters:
+        - $ref: '#/components/parameters/MessageId'
+      responses:
+        '200':
+          description: Message status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MessageStatus'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '410':
+          description: Message purged (ephemeral or TTL expired)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PurgedMessageStatus'
+
+  /api/agents/{agentId}/webhook:
+    get:
+      tags: [Webhooks]
+      summary: Get webhook configuration
+      description: Retrieve agent's webhook settings
+      parameters:
+        - $ref: '#/components/parameters/AgentId'
+      security:
+        - AgentAuth: []
+      responses:
+        '200':
+          description: Webhook configuration
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WebhookConfig'
+    post:
+      tags: [Webhooks]
+      summary: Configure webhook
+      description: |
+        Set up webhook for push delivery. Messages will be POSTed to webhook_url immediately.
+        If webhook fails, message stays queued for polling (fallback).
+      parameters:
+        - $ref: '#/components/parameters/AgentId'
+      security:
+        - AgentAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - webhook_url
+              properties:
+                webhook_url:
+                  type: string
+                  format: uri
+                webhook_secret:
+                  type: string
+                  description: Optional secret for HMAC signature (auto-generated if omitted)
+      responses:
+        '200':
+          description: Webhook configured
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WebhookConfigResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+    delete:
+      tags: [Webhooks]
+      summary: Remove webhook
+      description: Disable webhook push delivery, fall back to polling
+      parameters:
+        - $ref: '#/components/parameters/AgentId'
+      security:
+        - AgentAuth: []
+      responses:
+        '200':
+          description: Webhook removed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                  webhook_configured:
+                    type: boolean
+
+  /api/agents/{agentId}/trusted:
+    get:
+      tags: [Agents]
+      summary: List trusted agents
+      description: Get list of agents in trust allowlist
+      parameters:
+        - $ref: '#/components/parameters/AgentId'
+      security:
+        - AgentAuth: []
+      responses:
+        '200':
+          description: Trusted agents
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  trusted_agents:
+                    type: array
+                    items:
+                      type: string
+    post:
+      tags: [Agents]
+      summary: Add trusted agent
+      description: Add agent to trust allowlist
+      parameters:
+        - $ref: '#/components/parameters/AgentId'
+      security:
+        - AgentAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - agent_id
+              properties:
+                agent_id:
+                  type: string
+      responses:
+        '200':
+          description: Agent added to trusted list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  trusted_agents:
+                    type: array
+                    items:
+                      type: string
+
+  /api/agents/{agentId}/trusted/{trustedAgentId}:
+    delete:
+      tags: [Agents]
+      summary: Remove trusted agent
+      description: Remove agent from trust allowlist
+      parameters:
+        - $ref: '#/components/parameters/AgentId'
+        - name: trustedAgentId
+          in: path
+          required: true
+          schema:
+            type: string
+      security:
+        - AgentAuth: []
+      responses:
+        '200':
+          description: Agent removed from trusted list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  trusted_agents:
+                    type: array
+                    items:
+                      type: string
+
+  /api/agents/{agentId}/groups:
+    get:
+      tags: [Groups]
+      summary: List groups for an agent
+      description: List groups the agent is a member of
+      parameters:
+        - $ref: '#/components/parameters/AgentId'
+      security:
+        - AgentAuth: []
+      responses:
+        '200':
+          description: Agent groups list
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AgentGroupsResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/groups:
+    post:
+      tags: [Groups]
+      summary: Create a group
+      description: Create a new group owned by the requesting agent
+      security:
+        - AgentAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/GroupCreateRequest'
+      responses:
+        '201':
+          description: Group created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Group'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/groups/{groupId}:
+    get:
+      tags: [Groups]
+      summary: Get group info
+      description: Get group info. Members see full details; non-members see limited details.
+      parameters:
+        - $ref: '#/components/parameters/GroupId'
+      security:
+        - AgentAuth: []
+      responses:
+        '200':
+          description: Group info
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/Group'
+                  - $ref: '#/components/schemas/GroupPublicSummary'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    put:
+      tags: [Groups]
+      summary: Update group
+      description: Update group name/settings (admin/owner only)
+      parameters:
+        - $ref: '#/components/parameters/GroupId'
+      security:
+        - AgentAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/GroupUpdateRequest'
+      responses:
+        '200':
+          description: Group updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Group'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    delete:
+      tags: [Groups]
+      summary: Delete group
+      description: Delete group (owner only)
+      parameters:
+        - $ref: '#/components/parameters/GroupId'
+      security:
+        - AgentAuth: []
+      responses:
+        '204':
+          description: Group deleted
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/groups/{groupId}/members:
+    get:
+      tags: [Groups]
+      summary: List group members
+      description: List group members (must be a group member)
+      parameters:
+        - $ref: '#/components/parameters/GroupId'
+      security:
+        - AgentAuth: []
+      responses:
+        '200':
+          description: Members list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  members:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/GroupMember'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    post:
+      tags: [Groups]
+      summary: Add group member
+      description: Add a member to the group (admin/owner only)
+      parameters:
+        - $ref: '#/components/parameters/GroupId'
+      security:
+        - AgentAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/GroupAddMemberRequest'
+      responses:
+        '200':
+          description: Group updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Group'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Conflict
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /api/groups/{groupId}/members/{agentId}:
+    delete:
+      tags: [Groups]
+      summary: Remove group member
+      description: Remove a member (admin/owner) or remove self
+      parameters:
+        - $ref: '#/components/parameters/GroupId'
+        - $ref: '#/components/parameters/AgentId'
+      security:
+        - AgentAuth: []
+      responses:
+        '200':
+          description: Group updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Group'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/groups/{groupId}/join:
+    post:
+      tags: [Groups]
+      summary: Join group
+      description: Join an open or key-protected group
+      parameters:
+        - $ref: '#/components/parameters/GroupId'
+      security:
+        - AgentAuth: []
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/GroupJoinRequest'
+      responses:
+        '200':
+          description: Group updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Group'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Conflict
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /api/groups/{groupId}/leave:
+    post:
+      tags: [Groups]
+      summary: Leave group
+      description: Leave a group (owners cannot leave without deleting/transferring ownership)
+      parameters:
+        - $ref: '#/components/parameters/GroupId'
+      security:
+        - AgentAuth: []
+      responses:
+        '200':
+          description: Left group
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                  group_id:
+                    type: string
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/groups/{groupId}/messages:
+    post:
+      tags: [Groups]
+      summary: Post message to group
+      description: Fan out a message to all group members (except sender)
+      parameters:
+        - $ref: '#/components/parameters/GroupId'
+      security:
+        - AgentAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/GroupPostMessageRequest'
+      responses:
+        '201':
+          description: Group message accepted and fanned out
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GroupPostMessageResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    get:
+      tags: [Groups]
+      summary: Get group message history
+      description: Get group message history (if enabled)
+      parameters:
+        - $ref: '#/components/parameters/GroupId'
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 50
+            minimum: 1
+            maximum: 200
+      security:
+        - AgentAuth: []
+      responses:
+        '200':
+          description: Group history
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GroupHistoryResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+components:
+  securitySchemes:
+    AgentAuth:
+      type: apiKey
+      in: header
+      name: X-Agent-Id
+      description: Agent authentication (automatically applied, no auth required in dev mode)
+
+  parameters:
+    AgentId:
+      name: agentId
+      in: path
+      required: true
+      description: Agent identifier (e.g., agent://agent-name)
+      schema:
+        type: string
+        example: agent://agent-a
+    MessageId:
+      name: messageId
+      in: path
+      required: true
+      description: Message identifier
+      schema:
+        type: string
+        example: msg-1234567890
+    GroupId:
+      name: groupId
+      in: path
+      required: true
+      description: Group identifier (URI-like, must be URL-encoded in paths)
+      schema:
+        type: string
+        example: group://my-group-1a2b3c4d
+
+  schemas:
+    AgentRegistration:
+      type: object
+      required:
+        - agent_type
+      properties:
+        agent_id:
+          type: string
+          description: Optional agent ID (auto-generated if omitted)
+          example: agent://my-agent
+        agent_type:
+          type: string
+          description: Type/category of agent
+          example: claude_session
+        metadata:
+          type: object
+          additionalProperties: true
+          description: Custom agent metadata
+        webhook_url:
+          type: string
+          format: uri
+          description: Optional webhook URL for push delivery
+        webhook_secret:
+          type: string
+          description: Optional webhook secret (auto-generated if omitted)
+
+    AgentRegistrationResponse:
+      type: object
+      properties:
+        agent_id:
+          type: string
+        agent_type:
+          type: string
+        public_key:
+          type: string
+          description: Base64-encoded Ed25519 public key
+        secret_key:
+          type: string
+          description: Base64-encoded Ed25519 secret key (only returned on registration!)
+        webhook_url:
+          type: string
+        webhook_secret:
+          type: string
+          description: Webhook HMAC secret (only returned on registration!)
+        heartbeat:
+          $ref: '#/components/schemas/Heartbeat'
+
+    Agent:
+      type: object
+      properties:
+        agent_id:
+          type: string
+        agent_type:
+          type: string
+        public_key:
+          type: string
+        metadata:
+          type: object
+          additionalProperties: true
+        heartbeat:
+          $ref: '#/components/schemas/Heartbeat'
+        trusted_agents:
+          type: array
+          items:
+            type: string
+
+    Heartbeat:
+      type: object
+      properties:
+        last_heartbeat:
+          type: integer
+          format: int64
+          description: Unix timestamp (milliseconds)
+        status:
+          type: string
+          enum: [online, offline]
+        interval_ms:
+          type: integer
+          description: Recommended heartbeat interval
+        timeout_ms:
+          type: integer
+          description: Heartbeat timeout threshold
+
+    MessageEnvelope:
+      type: object
+      required:
+        - version
+        - type
+        - from
+        - to
+        - subject
+        - body
+        - timestamp
+      properties:
+        version:
+          type: string
+          enum: ['1.0']
+        id:
+          type: string
+          description: Message ID (auto-generated if omitted)
+        type:
+          type: string
+          description: >
+            Message type (application-defined string). Common conventions include
+            task.request, task.result, task.error, event, and notification, but
+            any string value is accepted. Application-layer protocols define their
+            own type vocabularies in the message body.
+        from:
+          type: string
+          description: Sender agent ID
+          example: agent://sender
+        to:
+          type: string
+          description: Recipient agent ID
+          example: agent://recipient
+        subject:
+          type: string
+          description: Message subject
+          example: run_tests
+        correlation_id:
+          type: string
+          description: Correlation ID for request/response pairing
+        headers:
+          type: object
+          additionalProperties: true
+          description: Custom headers
+        body:
+          type: object
+          additionalProperties: true
+          description: Message payload
+        ttl_sec:
+          type: integer
+          default: 86400
+          description: Time-to-live in seconds
+        timestamp:
+          type: string
+          format: date-time
+        signature:
+          $ref: '#/components/schemas/Signature'
+
+    ReplyEnvelope:
+      type: object
+      required:
+        - version
+        - type
+        - subject
+        - body
+        - timestamp
+      properties:
+        version:
+          type: string
+          enum: ['1.0']
+        id:
+          type: string
+        type:
+          type: string
+          enum: [task.result, task.error]
+        from:
+          type: string
+          description: Auto-filled from current agent
+        subject:
+          type: string
+        body:
+          type: object
+          additionalProperties: true
+        timestamp:
+          type: string
+          format: date-time
+        signature:
+          $ref: '#/components/schemas/Signature'
+
+    Signature:
+      type: object
+      required:
+        - alg
+        - kid
+        - sig
+      properties:
+        alg:
+          type: string
+          enum: [ed25519, hmac-sha256]
+        kid:
+          type: string
+          description: Key identifier (agent ID)
+        sig:
+          type: string
+          description: Base64-encoded signature
+
+    LeasedMessage:
+      type: object
+      properties:
+        message_id:
+          type: string
+        envelope:
+          $ref: '#/components/schemas/MessageEnvelope'
+        lease_until:
+          type: integer
+          format: int64
+          description: Lease expiration (Unix timestamp)
+        attempts:
+          type: integer
+          description: Delivery attempt count
+
+    MessageStatus:
+      type: object
+      properties:
+        id:
+          type: string
+        status:
+          type: string
+          enum: [queued, leased, acked, failed, expired, purged]
+        created_at:
+          type: integer
+          format: int64
+        updated_at:
+          type: integer
+          format: int64
+        attempts:
+          type: integer
+        lease_until:
+          type: integer
+          format: int64
+          nullable: true
+        acked_at:
+          type: integer
+          format: int64
+          nullable: true
+
+    InboxStats:
+      type: object
+      properties:
+        total:
+          type: integer
+        queued:
+          type: integer
+        leased:
+          type: integer
+        acked:
+          type: integer
+        failed:
+          type: integer
+        purged:
+          type: integer
+
+    PurgedMessageStatus:
+      type: object
+      required: [error, id, status, purge_reason, purged_at, body]
+      properties:
+        error:
+          type: string
+          example: MESSAGE_EXPIRED
+        message:
+          type: string
+          example: This message has been purged (ephemeral or TTL expired)
+        id:
+          type: string
+        from:
+          type: string
+        to:
+          type: string
+        subject:
+          type: string
+        status:
+          type: string
+          enum: [purged]
+        purged_at:
+          type: integer
+          format: int64
+        purge_reason:
+          type: string
+          enum: [acked, ttl_expired]
+        body:
+          type: 'null'
+          description: Always null — body has been purged
+
+    SystemStats:
+      type: object
+      properties:
+        agents:
+          type: object
+          properties:
+            total:
+              type: integer
+            online:
+              type: integer
+            offline:
+              type: integer
+        messages:
+          type: object
+          properties:
+            total:
+              type: integer
+            queued:
+              type: integer
+            leased:
+              type: integer
+            acked:
+              type: integer
+            failed:
+              type: integer
+            expired:
+              type: integer
+            purged:
+              type: integer
+
+    WebhookConfig:
+      type: object
+      properties:
+        webhook_url:
+          type: string
+          format: uri
+        webhook_configured:
+          type: boolean
+
+    WebhookConfigResponse:
+      type: object
+      properties:
+        agent_id:
+          type: string
+        webhook_url:
+          type: string
+          format: uri
+        webhook_secret:
+          type: string
+          description: Webhook HMAC secret
+
+    AgentGroupsResponse:
+      type: object
+      properties:
+        groups:
+          type: array
+          items:
+            $ref: '#/components/schemas/GroupSummary'
+
+    GroupSummary:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        role:
+          type: string
+          enum: [owner, admin, member]
+        member_count:
+          type: integer
+
+    GroupPublicSummary:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        access_type:
+          type: string
+          enum: [open, invite-only, key-protected]
+        member_count:
+          type: integer
+
+    GroupAccess:
+      type: object
+      properties:
+        type:
+          type: string
+          enum: [open, invite-only, key-protected]
+        join_key_hash:
+          type: string
+          nullable: true
+
+    GroupSettings:
+      type: object
+      properties:
+        history_visible:
+          type: boolean
+        max_members:
+          type: integer
+        message_ttl_sec:
+          type: integer
+
+    GroupMember:
+      type: object
+      properties:
+        agent_id:
+          type: string
+        role:
+          type: string
+          enum: [owner, admin, member]
+        joined_at:
+          type: integer
+          format: int64
+
+    Group:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        created_by:
+          type: string
+        access:
+          $ref: '#/components/schemas/GroupAccess'
+        settings:
+          $ref: '#/components/schemas/GroupSettings'
+        members:
+          type: array
+          items:
+            $ref: '#/components/schemas/GroupMember'
+        created_at:
+          type: integer
+          format: int64
+        updated_at:
+          type: integer
+          format: int64
+
+    GroupCreateRequest:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+          description: Group display name
+        access:
+          type: object
+          properties:
+            type:
+              type: string
+              enum: [open, invite-only, key-protected]
+            join_key:
+              type: string
+              description: Join key for key-protected groups (never returned)
+        settings:
+          $ref: '#/components/schemas/GroupSettings'
+
+    GroupUpdateRequest:
+      type: object
+      properties:
+        name:
+          type: string
+        settings:
+          $ref: '#/components/schemas/GroupSettings'
+
+    GroupAddMemberRequest:
+      type: object
+      required: [agent_id]
+      properties:
+        agent_id:
+          type: string
+        role:
+          type: string
+          enum: [owner, admin, member]
+
+    GroupJoinRequest:
+      type: object
+      properties:
+        key:
+          type: string
+
+    GroupPostMessageRequest:
+      type: object
+      required: [subject, body]
+      properties:
+        subject:
+          type: string
+        body:
+          type: object
+          additionalProperties: true
+        correlation_id:
+          type: string
+        reply_to:
+          type: string
+
+    GroupDelivery:
+      type: object
+      properties:
+        agent_id:
+          type: string
+        message_id:
+          type: string
+          nullable: true
+        status:
+          type: string
+          enum: [delivered, failed]
+        error:
+          type: string
+          nullable: true
+
+    GroupPostMessageResponse:
+      type: object
+      properties:
+        message_id:
+          type: string
+          description: Stable group message id
+        group_id:
+          type: string
+        deliveries:
+          type: array
+          items:
+            $ref: '#/components/schemas/GroupDelivery'
+        delivered:
+          type: integer
+        failed:
+          type: integer
+
+    GroupMessageHistoryItem:
+      type: object
+      properties:
+        id:
+          type: string
+        from:
+          type: string
+        subject:
+          type: string
+        body:
+          type: object
+          additionalProperties: true
+        timestamp:
+          type: string
+        group_id:
+          type: string
+
+    GroupHistoryResponse:
+      type: object
+      properties:
+        messages:
+          type: array
+          items:
+            $ref: '#/components/schemas/GroupMessageHistoryItem'
+        count:
+          type: integer
+        has_more:
+          type: boolean
+
+    Error:
+      type: object
+      properties:
+        error:
+          type: string
+        message:
+          type: string
+
+  responses:
+    BadRequest:
+      description: Bad request
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Forbidden:
+      description: Forbidden
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    NotFound:
+      description: Not found
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
